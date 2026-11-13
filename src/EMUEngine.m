@@ -60,6 +60,7 @@
 #define OUT_SAFETY_MS 2
 #define IN_SAFETY_MS 2.75      // a buffer may end on the first sample of a packet that is visible ~2.34 ms later
 #define FT_SIZE 128           // frame table entries (power of two, > ENQ_AHEAD + KPKT)
+#define PRIME_MS 300          // silence streamed before the restart that follows a clock rate change
 #define RING_MASK (EMU_RING_FRAMES - 1)
 
 typedef struct { double rate; int alt; int xu; int maxPacket; } RateInfo;
@@ -168,6 +169,9 @@ static void setRealtime(double ticksPerMs, double periodMs, double computationMs
     IOUSBHostInterface *acItf, *outItf, *inItf;
     IOUSBHostPipe *outPipe, *fbPipe, *inPipe;
     const RateInfo *ri;
+    const RateInfo *primedRate;      // the card has streamed at this rate since its clock was last set (ctlMutex)
+    int primedConnection;
+    _Atomic int connectionId;        // incremented every time the card is connected
 
     // OUT pool
     NSMutableData *outData[NSLOT];
@@ -267,6 +271,7 @@ static void *enqMain(void *arg);
     if (atomic_load(&rt->present) == p) return;
     atomic_store(&rt->present, p);
     if (!p) atomic_store(&dead, true);
+    else atomic_fetch_add(&connectionId, 1);
     os_log(elog(), "E-MU 0202 %{public}s", p ? "connected" : "disconnected");
     EMUPresenceCallback cb = presenceCb;
     void *ctx = presenceCtx;
@@ -323,7 +328,25 @@ static void *enqMain(void *arg);
         if (ri == r && !atomic_load(&dead)) return 0;
         [self stopLocked];
     }
+    // The first stream after the card's clock rate changed (or after it was connected) can settle into a
+    // different buffering state inside the card: 1-4 ms more or 1 ms less round trip than every later start
+    // at that rate (tools/engloop --switch). A short stream of silence and a restart puts it into the usual
+    // state, which the reported latency is calibrated for.
+    int connection = atomic_load(&connectionId);
+    BOOL needPrime = primedRate != r || primedConnection != connection;
+    int res = [self openAndStream:r];
+    if (res || !needPrime) return res;
+    usleep(PRIME_MS * 1000);
+    [self stopLocked];
+    res = [self openAndStream:r];
+    if (res) return res;
+    primedRate = r;
+    primedConnection = connection;
+    os_log(elog(), "first stream at %.0f Hz since the clock changed: restarted after %d ms of silence", r->rate, PRIME_MS);
+    return 0;
+}
 
+- (int)openAndStream:(const RateInfo *)r {
     NSError *err = nil;
     acItf = [self openInterface:0 error:&err];
     if (acItf) outItf = [self openInterface:1 error:&err];
@@ -336,6 +359,7 @@ static void *enqMain(void *arg);
     NSUInteger done = 0;
     if (![acItf sendDeviceRequest:req data:d bytesTransferred:&done completionTimeout:1.0 error:&err])
         return [self fail:-5 what:"set clock rate" error:err];
+    if (primedRate != r) primedRate = NULL;  // the card's clock may have just changed
     if (![outItf selectAlternateSetting:r->alt error:&err]) return [self fail:-6 what:"select playback alt" error:err];
     if (![inItf selectAlternateSetting:r->alt error:&err]) return [self fail:-6 what:"select capture alt" error:err];
     outPipe = [outItf copyPipeWithAddress:EP_OUT error:&err];
