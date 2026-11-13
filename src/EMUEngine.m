@@ -107,6 +107,8 @@ struct EMUEngine {
     _Atomic uint64_t stInPackets, stInErrors, stInRealigns, stInUnderruns, stInShortMax;
     _Atomic double stRate, stMaxDelay, stInPickupMax;
     _Atomic bool present, running;
+    _Atomic float outGainTarget;      // output gain set by the volume/mute controls (linear)
+    float outGainApplied;             // gain at the end of the last written buffer; Core Audio IO thread only
     void *impl;
 };
 
@@ -863,6 +865,8 @@ EMUEngine *EMUEngineCreate(void) {
     EMUEngine *rt = calloc(1, sizeof *rt);
     rt->ring = calloc(EMU_RING_FRAMES * EMU_CHANNELS, sizeof(float));
     rt->inRing = calloc(EMU_RING_FRAMES * EMU_CHANNELS, sizeof(float));
+    atomic_init(&rt->outGainTarget, 1.0f);
+    rt->outGainApplied = -1.0f;  // no buffer written yet: the first one starts at the target gain
     EMUEngineImpl *impl = [[EMUEngineImpl alloc] init];
     impl->rt = rt;
     rt->impl = (__bridge_retained void *)impl;
@@ -908,15 +912,28 @@ void EMUEngineWriteOutput(EMUEngine *e, double sampleTime, const float *frames, 
         if (S + n <= consumed) return;
         first = (uint32_t)(consumed - S);
     }
+    // Volume: ramp linearly from the previous buffer's gain to the target across this buffer,
+    // so that volume steps do not click.
+    float g1 = atomic_load_explicit(&e->outGainTarget, memory_order_relaxed);
+    float g0 = e->outGainApplied < 0.f ? g1 : e->outGainApplied;
+    float dg = n ? (g1 - g0) / (float)n : 0.f;
+    e->outGainApplied = g1;
     float *ring = e->ring;
     for (uint32_t i = first; i < n; i++) {
         uint32_t idx = (uint32_t)((S + i) & RING_MASK);
-        ring[2 * idx] = frames[2 * i];
-        ring[2 * idx + 1] = frames[2 * i + 1];
+        float g = g0 + dg * (float)(i + 1);
+        ring[2 * idx] = frames[2 * i] * g;
+        ring[2 * idx + 1] = frames[2 * i + 1] * g;
     }
     uint64_t end = S + n;
     if (end > atomic_load_explicit(&e->writtenEnd, memory_order_relaxed))
         atomic_store_explicit(&e->writtenEnd, end, memory_order_relaxed);
+}
+
+void EMUEngineSetOutputGain(EMUEngine *e, float gain) {
+    if (!(gain >= 0.f)) gain = 0.f;  // also catches NaN
+    if (gain > 1.f) gain = 1.f;
+    atomic_store_explicit(&e->outGainTarget, gain, memory_order_relaxed);
 }
 
 void EMUEngineReadInput(EMUEngine *e, double sampleTime, float *frames, uint32_t n) {

@@ -3,10 +3,14 @@
 // Publishes one device ("E-MU 0202 | USB") with a stereo output stream and a stereo input stream
 // while the card is connected. Audio goes through EMUEngine, which talks to the card over IOUSBHost.
 //
-// Object IDs: 1 = plug-in, 2 = device, 3 = output stream, 4 = input stream.
+// Object IDs: 1 = plug-in, 2 = device, 3 = output stream, 4 = input stream,
+//             5 = output volume control, 6 = output mute control.
+//
+// Volume and mute are applied in software (EMUEngineSetOutputGain) and remembered in the host's storage.
 
 #include <CoreAudio/AudioServerPlugIn.h>
 #include <dispatch/dispatch.h>
+#include <math.h>
 #include <os/log.h>
 #include <pthread.h>
 #include <stddef.h>
@@ -18,6 +22,8 @@ enum {
     kObjectID_Device = 2,
     kObjectID_Stream_Output = 3,
     kObjectID_Stream_Input = 4,
+    kObjectID_Volume_Output = 5,
+    kObjectID_Mute_Output = 6,
 };
 
 #define kDeviceUID "EMU0202USB:UserSpace"
@@ -37,7 +43,13 @@ static UInt32 gIOClientIDs[kMaxIOClients];  // clients that started IO on the cu
 static UInt32 gIOClients = 0;
 static bool gOutputActive = true;
 static bool gInputActive = true;
+static Float32 gVolume = 1.0f;  // output volume slider position, 0..1
+static bool gMute = false;
+static dispatch_queue_t gStorageQueue;
 static os_log_t gLog;
+
+#define kStorageKeyVolume CFSTR("OutputVolume")
+#define kStorageKeyMute CFSTR("OutputMute")
 
 #pragma mark Prototypes
 
@@ -200,6 +212,84 @@ static void presenceChanged(void *ctx, bool present) {
     });
 }
 
+#pragma mark Volume
+
+// Slider position s (0..1) maps to gain s^3, i.e. 60*log10(s) dB: half way is -18 dB, and the 16 steps of the
+// volume keys go 0, -1.7, -3.5 ... -36 (at 1/4) ... -72 dB. The bottom of the slider is silence.
+#define kVolumeMinDB -96.0f
+
+static Float32 clamp01(Float32 v) { return v > 0.f ? (v < 1.f ? v : 1.f) : 0.f; }  // NaN -> 0
+
+static Float32 volumeToDB(Float32 s) {
+    s = clamp01(s);
+    Float32 db = s > 0.f ? 60.f * log10f(s) : kVolumeMinDB;
+    return db < kVolumeMinDB ? kVolumeMinDB : db;
+}
+
+static Float32 dbToVolume(Float32 db) {
+    if (!(db > kVolumeMinDB)) return 0.f;
+    if (db >= 0.f) return 1.f;
+    return powf(10.f, db / 60.f);
+}
+
+// Call with gStateMutex held.
+static void applyGainLocked(void) {
+    Float32 s = clamp01(gVolume);
+    EMUEngineSetOutputGain(gEngine, gMute ? 0.f : s * s * s);
+}
+
+static void loadControls(void) {
+    AudioServerPlugInHostRef host = gHost;
+    CFPropertyListRef v = NULL;
+    if (host && host->CopyFromStorage(host, kStorageKeyVolume, &v) == 0 && v) {
+        Float32 f;
+        if (CFGetTypeID(v) == CFNumberGetTypeID() && CFNumberGetValue(v, kCFNumberFloat32Type, &f)) gVolume = clamp01(f);
+        CFRelease(v);
+    }
+    v = NULL;
+    if (host && host->CopyFromStorage(host, kStorageKeyMute, &v) == 0 && v) {
+        if (CFGetTypeID(v) == CFBooleanGetTypeID()) gMute = CFBooleanGetValue(v);
+        CFRelease(v);
+    }
+    pthread_mutex_lock(&gStateMutex);
+    applyGainLocked();
+    pthread_mutex_unlock(&gStateMutex);
+    os_log(gLog, "output volume %.3f (%.1f dB)%{public}s", gVolume, volumeToDB(gVolume), gMute ? ", muted" : "");
+}
+
+// Writes the current values on a serial queue, so the latest value is always the one stored.
+static void saveControls(void) {
+    AudioServerPlugInHostRef host = gHost;
+    if (!host) return;
+    dispatch_async(gStorageQueue, ^{
+        pthread_mutex_lock(&gStateMutex);
+        Float32 vol = gVolume;
+        bool mute = gMute;
+        pthread_mutex_unlock(&gStateMutex);
+        CFNumberRef n = CFNumberCreate(NULL, kCFNumberFloat32Type, &vol);
+        host->WriteToStorage(host, kStorageKeyVolume, n);
+        CFRelease(n);
+        host->WriteToStorage(host, kStorageKeyMute, mute ? kCFBooleanTrue : kCFBooleanFalse);
+    });
+}
+
+// Objects the device owns in `scope`, filtered by an OwnedObjects class qualifier; out holds up to 4.
+static UInt32 deviceOwnedObjects(AudioObjectPropertyScope scope, UInt32 qSize, const void *q, AudioObjectID *out) {
+    AudioObjectID streams[2];
+    UInt32 ns = streamsForScope(scope, streams), n = 0;
+    if (qualifierAllows(qSize, q, kAudioStreamClassID))
+        for (UInt32 i = 0; i < ns; i++) out[n++] = streams[i];
+    if (scope == kAudioObjectPropertyScopeGlobal || scope == kAudioObjectPropertyScopeOutput) {
+        if (qualifierAllows(qSize, q, kAudioControlClassID) || qualifierAllows(qSize, q, kAudioLevelControlClassID) ||
+            qualifierAllows(qSize, q, kAudioVolumeControlClassID))
+            out[n++] = kObjectID_Volume_Output;
+        if (qualifierAllows(qSize, q, kAudioControlClassID) || qualifierAllows(qSize, q, kAudioBooleanControlClassID) ||
+            qualifierAllows(qSize, q, kAudioMuteControlClassID))
+            out[n++] = kObjectID_Mute_Output;
+    }
+    return n;
+}
+
 static void requestRateChange(Float64 rate) {
     AudioServerPlugInHostRef host = gHost;
     if (!host) return;
@@ -248,7 +338,9 @@ static OSStatus EMU_Initialize(AudioServerPlugInDriverRef inDriver, AudioServerP
     if (inDriver != gDriverRef) return kAudioHardwareBadObjectError;
     gHost = inHost;
     gLog = os_log_create("ru.masatec.emu0202", "plugin");
+    gStorageQueue = dispatch_queue_create("ru.masatec.emu0202.storage", DISPATCH_QUEUE_SERIAL);
     gEngine = EMUEngineCreate();
+    loadControls();
     EMUEngineStartMonitoring(gEngine, presenceChanged, NULL);
     os_log(gLog, "E-MU 0202 user-space driver loaded");
     return kAudioHardwareNoError;
@@ -360,6 +452,26 @@ static Boolean EMU_HasProperty(AudioServerPlugInDriverRef inDriver, AudioObjectI
             return true;
         }
         return false;
+    case kObjectID_Volume_Output:
+    case kObjectID_Mute_Output:
+        switch (a->mSelector) {
+        case kAudioObjectPropertyBaseClass:
+        case kAudioObjectPropertyClass:
+        case kAudioObjectPropertyOwner:
+        case kAudioObjectPropertyOwnedObjects:
+        case kAudioControlPropertyScope:
+        case kAudioControlPropertyElement:
+            return true;
+        case kAudioLevelControlPropertyScalarValue:
+        case kAudioLevelControlPropertyDecibelValue:
+        case kAudioLevelControlPropertyDecibelRange:
+        case kAudioLevelControlPropertyConvertScalarToDecibels:
+        case kAudioLevelControlPropertyConvertDecibelsToScalar:
+            return inObjectID == kObjectID_Volume_Output;
+        case kAudioBooleanControlPropertyValue:
+            return inObjectID == kObjectID_Mute_Output;
+        }
+        return false;
     }
     return false;
 }
@@ -375,6 +487,10 @@ static OSStatus EMU_IsPropertySettable(AudioServerPlugInDriverRef inDriver, Audi
         (a->mSelector == kAudioStreamPropertyIsActive || a->mSelector == kAudioStreamPropertyVirtualFormat ||
          a->mSelector == kAudioStreamPropertyPhysicalFormat))
         *outIsSettable = true;
+    if (inObjectID == kObjectID_Volume_Output &&
+        (a->mSelector == kAudioLevelControlPropertyScalarValue || a->mSelector == kAudioLevelControlPropertyDecibelValue))
+        *outIsSettable = true;
+    if (inObjectID == kObjectID_Mute_Output && a->mSelector == kAudioBooleanControlPropertyValue) *outIsSettable = true;
     return kAudioHardwareNoError;
 }
 
@@ -415,15 +531,17 @@ static OSStatus EMU_GetPropertyDataSize(AudioServerPlugInDriverRef inDriver, Aud
         case kAudioObjectPropertyManufacturer:
         case kAudioDevicePropertyDeviceUID:
         case kAudioDevicePropertyModelUID: *outDataSize = sizeof(CFStringRef); return 0;
-        case kAudioObjectPropertyOwnedObjects:
-        case kAudioDevicePropertyStreams: {
-            AudioObjectID ids[2];
-            bool allowed = a->mSelector == kAudioDevicePropertyStreams ||
-                           qualifierAllows(inQualifierDataSize, inQualifierData, kAudioStreamClassID);
-            *outDataSize = allowed ? streamsForScope(a->mScope, ids) * sizeof(AudioObjectID) : 0;
+        case kAudioObjectPropertyOwnedObjects: {
+            AudioObjectID ids[4];
+            *outDataSize = deviceOwnedObjects(a->mScope, inQualifierDataSize, inQualifierData, ids) * sizeof(AudioObjectID);
             return 0;
         }
-        case kAudioObjectPropertyControlList: *outDataSize = 0; return 0;
+        case kAudioDevicePropertyStreams: {
+            AudioObjectID ids[2];
+            *outDataSize = streamsForScope(a->mScope, ids) * sizeof(AudioObjectID);
+            return 0;
+        }
+        case kAudioObjectPropertyControlList: *outDataSize = 2 * sizeof(AudioObjectID); return 0;
         case kAudioDevicePropertyRelatedDevices: *outDataSize = sizeof(AudioObjectID); return 0;
         case kAudioDevicePropertyTransportType:
         case kAudioDevicePropertyClockDomain:
@@ -463,6 +581,20 @@ static OSStatus EMU_GetPropertyDataSize(AudioServerPlugInDriverRef inDriver, Aud
             return 0;
         }
         return kAudioHardwareUnknownPropertyError;
+    case kObjectID_Volume_Output:
+    case kObjectID_Mute_Output:
+        if (!EMU_HasProperty(inDriver, inObjectID, inClientProcessID, a)) return kAudioHardwareUnknownPropertyError;
+        switch (a->mSelector) {
+        case kAudioObjectPropertyBaseClass:
+        case kAudioObjectPropertyClass: *outDataSize = sizeof(AudioClassID); return 0;
+        case kAudioObjectPropertyOwner: *outDataSize = sizeof(AudioObjectID); return 0;
+        case kAudioObjectPropertyOwnedObjects: *outDataSize = 0; return 0;
+        case kAudioControlPropertyScope: *outDataSize = sizeof(AudioObjectPropertyScope); return 0;
+        case kAudioControlPropertyElement: *outDataSize = sizeof(AudioObjectPropertyElement); return 0;
+        case kAudioLevelControlPropertyDecibelRange: *outDataSize = sizeof(AudioValueRange); return 0;
+        case kAudioBooleanControlPropertyValue: *outDataSize = sizeof(UInt32); return 0;
+        default: *outDataSize = sizeof(Float32); return 0;  // level values and conversions
+        }
     }
     return kAudioHardwareBadObjectError;
 }
@@ -484,6 +616,8 @@ static OSStatus EMU_GetPropertyData(AudioServerPlugInDriverRef inDriver, AudioOb
     bool present = gPresent;
     bool running = gIOClients > 0;
     bool outActive = gOutputActive, inActive = gInputActive;
+    Float32 volume = gVolume;
+    bool mute = gMute;
     pthread_mutex_unlock(&gStateMutex);
 
     switch (inObjectID) {
@@ -529,17 +663,23 @@ static OSStatus EMU_GetPropertyData(AudioServerPlugInDriverRef inDriver, AudioOb
         case kAudioDevicePropertyDeviceUID: NEED(sizeof(CFStringRef)); *(CFStringRef *)outData = CFSTR(kDeviceUID); return 0;
         case kAudioDevicePropertyModelUID: NEED(sizeof(CFStringRef)); *(CFStringRef *)outData = CFSTR(kModelUID); return 0;
         case kAudioObjectPropertyOwnedObjects:
-        case kAudioDevicePropertyStreams: {
-            AudioObjectID ids[2];
-            bool allowed = a->mSelector == kAudioDevicePropertyStreams ||
-                           qualifierAllows(inQualifierDataSize, inQualifierData, kAudioStreamClassID);
-            UInt32 n = allowed ? streamsForScope(a->mScope, ids) : 0;
+        case kAudioDevicePropertyStreams:
+        case kAudioObjectPropertyControlList: {
+            AudioObjectID ids[4];
+            UInt32 n;
+            if (a->mSelector == kAudioObjectPropertyOwnedObjects)
+                n = deviceOwnedObjects(a->mScope, inQualifierDataSize, inQualifierData, ids);
+            else if (a->mSelector == kAudioDevicePropertyStreams) n = streamsForScope(a->mScope, ids);
+            else {
+                ids[0] = kObjectID_Volume_Output;
+                ids[1] = kObjectID_Mute_Output;
+                n = 2;
+            }
             if (n > inDataSize / sizeof(AudioObjectID)) n = inDataSize / sizeof(AudioObjectID);
             memcpy(outData, ids, n * sizeof(AudioObjectID));
             *outDataSize = n * sizeof(AudioObjectID);
             return 0;
         }
-        case kAudioObjectPropertyControlList: *outDataSize = 0; return 0;
         case kAudioDevicePropertyRelatedDevices: NEED(sizeof(AudioObjectID)); *(AudioObjectID *)outData = kObjectID_Device; return 0;
         case kAudioDevicePropertyTransportType: NEED(sizeof(UInt32)); *(UInt32 *)outData = kAudioDeviceTransportTypeUSB; return 0;
         case kAudioDevicePropertyClockDomain: NEED(sizeof(UInt32)); *(UInt32 *)outData = 0; return 0;
@@ -623,6 +763,50 @@ static OSStatus EMU_GetPropertyData(AudioServerPlugInDriverRef inDriver, AudioOb
         }
         return kAudioHardwareUnknownPropertyError;
     }
+
+    case kObjectID_Volume_Output:
+    case kObjectID_Mute_Output: {
+        if (!EMU_HasProperty(inDriver, inObjectID, inClientProcessID, a)) return kAudioHardwareUnknownPropertyError;
+        bool isVolume = inObjectID == kObjectID_Volume_Output;
+        switch (a->mSelector) {
+        case kAudioObjectPropertyBaseClass:
+            NEED(sizeof(AudioClassID));
+            *(AudioClassID *)outData = isVolume ? kAudioLevelControlClassID : kAudioBooleanControlClassID;
+            return 0;
+        case kAudioObjectPropertyClass:
+            NEED(sizeof(AudioClassID));
+            *(AudioClassID *)outData = isVolume ? kAudioVolumeControlClassID : kAudioMuteControlClassID;
+            return 0;
+        case kAudioObjectPropertyOwner: NEED(sizeof(AudioObjectID)); *(AudioObjectID *)outData = kObjectID_Device; return 0;
+        case kAudioObjectPropertyOwnedObjects: *outDataSize = 0; return 0;
+        case kAudioControlPropertyScope:
+            NEED(sizeof(AudioObjectPropertyScope));
+            *(AudioObjectPropertyScope *)outData = kAudioObjectPropertyScopeOutput;
+            return 0;
+        case kAudioControlPropertyElement:
+            NEED(sizeof(AudioObjectPropertyElement));
+            *(AudioObjectPropertyElement *)outData = kAudioObjectPropertyElementMain;
+            return 0;
+        case kAudioLevelControlPropertyScalarValue: NEED(sizeof(Float32)); *(Float32 *)outData = volume; return 0;
+        case kAudioLevelControlPropertyDecibelValue: NEED(sizeof(Float32)); *(Float32 *)outData = volumeToDB(volume); return 0;
+        case kAudioLevelControlPropertyDecibelRange:
+            NEED(sizeof(AudioValueRange));
+            ((AudioValueRange *)outData)->mMinimum = kVolumeMinDB;
+            ((AudioValueRange *)outData)->mMaximum = 0.0;
+            return 0;
+        // Conversions: the value to convert comes in outData and is replaced with the result.
+        case kAudioLevelControlPropertyConvertScalarToDecibels:
+            NEED(sizeof(Float32));
+            *(Float32 *)outData = volumeToDB(*(Float32 *)outData);
+            return 0;
+        case kAudioLevelControlPropertyConvertDecibelsToScalar:
+            NEED(sizeof(Float32));
+            *(Float32 *)outData = dbToVolume(*(Float32 *)outData);
+            return 0;
+        case kAudioBooleanControlPropertyValue: NEED(sizeof(UInt32)); *(UInt32 *)outData = mute ? 1 : 0; return 0;
+        }
+        return kAudioHardwareUnknownPropertyError;
+    }
     }
     return kAudioHardwareBadObjectError;
 }
@@ -666,6 +850,42 @@ static OSStatus EMU_SetPropertyData(AudioServerPlugInDriverRef inDriver, AudioOb
             notify(inObjectID, 1, &addr);
             return kAudioHardwareNoError;
         }
+    }
+    if (inObjectID == kObjectID_Volume_Output &&
+        (a->mSelector == kAudioLevelControlPropertyScalarValue || a->mSelector == kAudioLevelControlPropertyDecibelValue)) {
+        if (inDataSize != sizeof(Float32)) return kAudioHardwareBadPropertySizeError;
+        Float32 v = *(const Float32 *)inData;
+        Float32 s = a->mSelector == kAudioLevelControlPropertyScalarValue ? clamp01(v) : dbToVolume(v);
+        pthread_mutex_lock(&gStateMutex);
+        bool change = s != gVolume;
+        gVolume = s;
+        applyGainLocked();
+        pthread_mutex_unlock(&gStateMutex);
+        if (change) {
+            AudioObjectPropertyAddress addrs[] = {
+                {kAudioLevelControlPropertyScalarValue, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain},
+                {kAudioLevelControlPropertyDecibelValue, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain},
+            };
+            notify(kObjectID_Volume_Output, 2, addrs);
+            saveControls();
+        }
+        return kAudioHardwareNoError;
+    }
+    if (inObjectID == kObjectID_Mute_Output && a->mSelector == kAudioBooleanControlPropertyValue) {
+        if (inDataSize != sizeof(UInt32)) return kAudioHardwareBadPropertySizeError;
+        bool m = *(const UInt32 *)inData != 0;
+        pthread_mutex_lock(&gStateMutex);
+        bool change = m != gMute;
+        gMute = m;
+        applyGainLocked();
+        pthread_mutex_unlock(&gStateMutex);
+        if (change) {
+            AudioObjectPropertyAddress addr = {kAudioBooleanControlPropertyValue, kAudioObjectPropertyScopeGlobal,
+                                               kAudioObjectPropertyElementMain};
+            notify(kObjectID_Mute_Output, 1, &addr);
+            saveControls();
+        }
+        return kAudioHardwareNoError;
     }
     return EMU_HasProperty(inDriver, inObjectID, inClientProcessID, a) ? kAudioHardwareUnsupportedOperationError
                                                                         : kAudioHardwareUnknownPropertyError;

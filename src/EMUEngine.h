@@ -53,6 +53,10 @@ void EMUEngineWriteOutput(EMUEngine *e, double sampleTime, const float *frames, 
 void EMUEngineReadInput(EMUEngine *e, double sampleTime, float *frames, uint32_t frameCount);
 void EMUEngineGetZeroTimeStamp(EMUEngine *e, double *sampleTime, uint64_t *hostTime, uint64_t *seed);
 
+// Linear gain applied to everything written with EMUEngineWriteOutput (1 = unchanged, 0 = silence).
+// Any thread; changes are ramped over one IO buffer.
+void EMUEngineSetOutputGain(EMUEngine *e, float gain);
+
 void EMUEngineGetStats(EMUEngine *e, EMUEngineStats *s);
 
 #ifdef __cplusplus
