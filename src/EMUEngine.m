@@ -720,10 +720,12 @@ static void *enqMain(void *arg);
         atomic_store_explicit(&rt->inAvail, inPos, memory_order_release);
     }
     float *ring = rt->inRing;
+    // The card sends the right jack (R, Hi-Z/Line) first and the left jack (L, Mic/Hi-Z/Line) second.
+    // Checked with a guitar in the left jack: it showed up in the second slot, so swap to keep Input 1 = L.
     for (uint32_t j = 0; j < n; j++) {
         uint32_t idx = (uint32_t)((inPos + j) & RING_MASK);
-        ring[2 * idx] = p ? get24(p + j * FRAME_BYTES) : 0.f;
-        ring[2 * idx + 1] = p ? get24(p + j * FRAME_BYTES + 3) : 0.f;
+        ring[2 * idx] = p ? get24(p + j * FRAME_BYTES + 3) : 0.f;
+        ring[2 * idx + 1] = p ? get24(p + j * FRAME_BYTES) : 0.f;
     }
     inPos += n;
     atomic_store_explicit(&rt->inAvail, inPos, memory_order_release);
