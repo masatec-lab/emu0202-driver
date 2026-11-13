@@ -20,5 +20,6 @@ clang "${CFLAGS[@]}" -fobjc-arc tools/emutest.m src/EMUEngine.m -o build/emutest
 clang "${CFLAGS[@]}" tools/plugintest.c -o build/plugintest -framework CoreAudio -framework CoreFoundation
 clang "${CFLAGS[@]}" tools/haltest.c -o build/haltest -framework CoreAudio -framework CoreFoundation
 clang "${CFLAGS[@]}" tools/controltest.c -o build/controltest -framework CoreAudio -framework CoreFoundation
+clang "${CFLAGS[@]}" tools/looptest.c -o build/looptest -framework CoreAudio -framework CoreFoundation
 
-echo "Built $OUT, build/emutest, build/plugintest, build/haltest, build/controltest"
+echo "Built $OUT, build/emutest, build/plugintest, build/haltest, build/controltest, build/looptest"

@@ -722,12 +722,12 @@ static void *enqMain(void *arg);
         atomic_store_explicit(&rt->inAvail, inPos, memory_order_release);
     }
     float *ring = rt->inRing;
-    // The card sends the right jack (R, Hi-Z/Line) first and the left jack (L, Mic/Hi-Z/Line) second.
-    // Checked with a guitar in the left jack: it showed up in the second slot, so swap to keep Input 1 = L.
+    // Standard order: left jack (L, Mic/Hi-Z/Line) first, right jack (R, Hi-Z/Line) second.
+    // Checked with a loopback cable from output R into the R input jack: it arrives in the second slot.
     for (uint32_t j = 0; j < n; j++) {
         uint32_t idx = (uint32_t)((inPos + j) & RING_MASK);
-        ring[2 * idx] = p ? get24(p + j * FRAME_BYTES + 3) : 0.f;
-        ring[2 * idx + 1] = p ? get24(p + j * FRAME_BYTES) : 0.f;
+        ring[2 * idx] = p ? get24(p + j * FRAME_BYTES) : 0.f;
+        ring[2 * idx + 1] = p ? get24(p + j * FRAME_BYTES + 3) : 0.f;
     }
     inPos += n;
     atomic_store_explicit(&rt->inAvail, inPos, memory_order_release);
@@ -899,7 +899,13 @@ void EMUEngineStop(EMUEngine *e) {
 // Output: timeline -> wire is LEAD ms, minus the frame being on the wire 1 ms before t(F).
 uint32_t EMUEngineOutputLatencyFrames(double rate) { return (uint32_t)((LEAD_MS - WIRE_EARLY_MS) * rate / 1000.0); }
 uint32_t EMUEngineOutputSafetyOffsetFrames(double rate) { return (uint32_t)(OUT_SAFETY_MS * rate / 1000.0); }
-uint32_t EMUEngineInputLatencyFrames(double rate) { return 0; }  // calibrate with a loopback cable later
+// Measured with a loopback cable (tools/looptest, output R -> input R): the real round trip is longer than the
+// output latency above by 2.95 ms + 67 frames at 44.1, 48, 88.2 and 96 kHz, within 1-2 frames. The frames are
+// most likely the converters' filters, the milliseconds buffering inside the card. Reported as input latency,
+// so that DAWs, which add both latencies, place recordings where they were played.
+#define IN_EXTRA_MS 2.95
+#define IN_EXTRA_FRAMES 67
+uint32_t EMUEngineInputLatencyFrames(double rate) { return (uint32_t)lround(IN_EXTRA_MS * rate / 1000.0 + IN_EXTRA_FRAMES); }
 uint32_t EMUEngineInputSafetyOffsetFrames(double rate) { return (uint32_t)(IN_SAFETY_MS * rate / 1000.0); }
 
 void EMUEngineWriteOutput(EMUEngine *e, double sampleTime, const float *frames, uint32_t n) {
